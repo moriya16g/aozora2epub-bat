@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+/input/*
+!/input/.gitkeep
+/output/
+*.epub
+*.epub.tmp
