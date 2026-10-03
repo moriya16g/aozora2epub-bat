@@ -833,6 +833,9 @@ rt { font-size: 0.5em; }
 .illust { text-align: center; text-indent: 0; }
 img.illust { max-width: 100%; max-height: 100%; }
 .colophon p { font-size: 0.85em; }
+.cover-page { margin: 0; padding: 0; }
+.cover { margin: 0; padding: 0; text-align: center; }
+.cover img { max-width: 100%; max-height: 100%; }
 '''
     emph = {
         'em-sesame': 'filled sesame', 'em-sesame-open': 'open sesame',
@@ -939,6 +942,18 @@ def write_epub(book, out_path):
         if in_spine:
             spine.append('<itemref idref="%s"/>' % item_id)
 
+    cover_meta = ''
+    if book.cover:
+        ext = Path(book.cover).suffix.lower()
+        cover_name = 'cover' + ('.jpg' if ext == '.jpeg' else ext)
+        files.append(('OEBPS/images/' + cover_name, Path(book.cover).read_bytes()))
+        manifest.append('<item id="cover" href="images/%s" media-type="%s" properties="cover-image"/>'
+                        % (cover_name, MEDIA_TYPES[ext]))
+        cover_meta = '\n    <meta name="cover" content="cover"/>'
+        add_xhtml('coverpage', 'cover.xhtml', full_title,
+                  '<div class="cover"><img src="../images/%s" alt="表紙"/></div>' % cover_name,
+                  'cover-page')
+
     add_xhtml('titlepage', 'title.xhtml', full_title,
               '<div class="titlepage">\n%s\n</div>' % '\n'.join(book.header_lines), 'titlepage')
 
@@ -970,8 +985,10 @@ def write_epub(book, out_path):
     nav_body = ('<nav epub:type="toc" id="toc">\n<h1>目次</h1>\n%s\n</nav>\n'
                 '<nav epub:type="landmarks" id="landmarks" hidden="">\n<ol>\n'
                 '  <li><a epub:type="toc" href="nav.xhtml">目次</a></li>\n'
-                '  <li><a epub:type="bodymatter" href="%s">本文</a></li>\n</ol>\n</nav>'
-                % (nav_ol(local(nodes)), body_start))
+                '%s  <li><a epub:type="bodymatter" href="%s">本文</a></li>\n</ol>\n</nav>'
+                % (nav_ol(local(nodes)),
+                   '  <li><a epub:type="cover" href="cover.xhtml">表紙</a></li>\n' if book.cover else '',
+                   body_start))
     files.append(('OEBPS/text/nav.xhtml', xhtml('目次', nav_body, False).encode('utf-8')))
     manifest.append('<item id="nav" href="text/nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>')
     spine.append('<itemref idref="nav" linear="no"/>')
@@ -1003,15 +1020,6 @@ def write_epub(book, out_path):
         files.append(('OEBPS/images/' + name, Path(src).read_bytes()))
         manifest.append('<item id="%s" href="images/%s" media-type="%s"/>'
                         % (name.replace('.', '_'), name, MEDIA_TYPES[Path(name).suffix]))
-    cover_meta = ''
-    if book.cover:
-        ext = book.cover.suffix.lower()
-        name = 'cover' + ('.jpg' if ext == '.jpeg' else ext)
-        files.append(('OEBPS/images/' + name, book.cover.read_bytes()))
-        manifest.append('<item id="cover" href="images/%s" media-type="%s" properties="cover-image"/>'
-                        % (name, MEDIA_TYPES[ext]))
-        cover_meta = '\n    <meta name="cover" content="cover"/>'
-
     meta = ['<dc:identifier id="BookId">%s</dc:identifier>' % book_id,
             '<dc:title id="title">%s</dc:title>' % esc(full_title),
             '<dc:language>ja</dc:language>']
@@ -1063,12 +1071,52 @@ def write_epub(book, out_path):
 # ファイル単位・一括変換
 # ---------------------------------------------------------------------------
 
-def find_cover(txt_path):
-    for ext in ('.jpg', '.jpeg', '.png'):
-        for cand in (txt_path.with_suffix(ext), txt_path.with_suffix(ext.upper())):
-            if cand.is_file():
-                return cand
-    return None
+IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.gif')
+
+
+def parse_filename(stem):
+    """「著者名-タイトル(補足)」形式のファイル名から (著者名, タイトル) を取り出す。
+
+    区切りは半角の「-」と「(」「[」(全角は区切りとみなさない)。
+    最初の「-」より前が著者名、その後ろから「(」「[」の手前までがタイトル。
+    「-」が無いファイル名はこの形式ではないとみなし (None, None) を返す。
+    """
+    if '-' not in stem:
+        return None, None
+    author, rest = stem.split('-', 1)
+    author = re.split(r'[(\[]', author)[0].strip(' _　')
+    title = re.split(r'[(\[]', rest)[0].strip(' _　')
+    return author or None, title or None
+
+
+class CoverFinder:
+    """作品ファイルと同じ名前 (拡張子違い) の画像を探す。大文字小文字は区別しない。"""
+
+    def __init__(self):
+        self._cache = {}
+
+    def _index(self, directory, recursive):
+        key = (str(Path(directory).resolve()), recursive)
+        if key not in self._cache:
+            idx = {}
+            it = Path(directory).rglob('*') if recursive else Path(directory).glob('*')
+            # 浅い階層・名前順で先に見つかったものを優先
+            for f in sorted(it, key=lambda x: (len(x.parts), str(x))):
+                if f.suffix.lower() in IMAGE_EXTS and f.is_file():
+                    idx.setdefault(f.stem.lower(), f)
+            self._cache[key] = idx
+        return self._cache[key]
+
+    def find(self, stems, near, root=None, recursive=True):
+        """near (作品と同じフォルダ) を先に探し、無ければ root 以下を探す。"""
+        for directory, rec in ((near, False), (root, recursive)):
+            if directory is None:
+                continue
+            idx = self._index(directory, rec)
+            for stem in stems:
+                if stem.lower() in idx:
+                    return idx[stem.lower()]
+        return None
 
 
 def safe_filename(s):
@@ -1076,14 +1124,44 @@ def safe_filename(s):
     return s[:120] or 'book'
 
 
-def convert_file(txt_path, out_dir, opts, out_stem=None):
-    """1 つのテキストファイルを変換し、出力した EPUB のパスを返す。"""
+def title_page_lines(book):
+    lines = ['<h1 class="title">%s</h1>' % esc(book.title)]
+    if book.subtitle:
+        lines.append('<p class="subtitle">%s</p>' % esc(book.subtitle))
+    if book.author:
+        lines.append('<p class="author">%s</p>' % esc(book.author))
+    for c in book.contributors:
+        lines.append('<p class="contrib">%s</p>' % esc(c))
+    return lines
+
+
+def apply_filename_metadata(book, stem):
+    """ファイル名から取得した著者名・タイトルで上書きする。"""
+    author, title = parse_filename(stem)
+    if not (author or title):
+        return False
+    if title:
+        if title != book.title:
+            book.subtitle = ''
+        book.title = title
+    if author:
+        if author in book.contributors:
+            book.contributors.remove(author)
+        book.author = author
+    book.header_lines = title_page_lines(book)
+    return True
+
+
+def convert_file(txt_path, out_dir, opts, out_stem=None, name_stem=None, cover=None):
+    """1 つのテキストファイルを変換し、(出力した EPUB のパス, Book) を返す。"""
     txt_path = Path(txt_path)
     text = read_text(txt_path, opts.encoding)
     book = convert_text(text, txt_path.parent, txt_path.stem,
-                        vertical=not opts.horizontal, auto_tcy=not opts.no_auto_tcy)
+                        vertical=opts.writing != 'yoko', auto_tcy=not opts.no_auto_tcy)
     book.source = txt_path.name
-    book.cover = find_cover(txt_path)
+    book.cover = cover
+    if opts.name_from_filename:
+        apply_filename_metadata(book, name_stem or txt_path.stem)
     if opts.title_filename:
         name = ('[%s] ' % book.author if book.author else '') + book.title + \
                (' ' + book.subtitle if book.subtitle else '')
@@ -1104,7 +1182,8 @@ def zip_member_name(info):
         return info.filename
 
 
-def convert_zip(zip_path, out_dir, opts):
+def convert_zip(zip_path, out_dir, opts, covers, root=None):
+    zip_path = Path(zip_path)
     results = []
     with tempfile.TemporaryDirectory() as tmp, zipfile.ZipFile(zip_path) as z:
         tmp = Path(tmp)
@@ -1119,12 +1198,18 @@ def convert_zip(zip_path, out_dir, opts):
             dest.write_bytes(z.read(info))
         txts = sorted(p for p in tmp.rglob('*') if p.is_file() and p.suffix.lower() == '.txt')
         for t in txts:
-            stem = Path(zip_path).stem if len(txts) == 1 else t.stem
-            results.append(convert_file(t, out_dir, opts, out_stem=stem))
+            single = len(txts) == 1
+            stems = [zip_path.stem, t.stem] if single else [t.stem]
+            cover = (covers.find(stems, zip_path.parent, root, not opts.no_recursive)
+                     or covers.find(stems, t.parent))
+            name_stem = zip_path.stem if single and parse_filename(zip_path.stem)[1] else t.stem
+            results.append(convert_file(t, out_dir, opts, out_stem=zip_path.stem if single else t.stem,
+                                        name_stem=name_stem, cover=cover))
     return results
 
 
 def iter_inputs(paths, recursive):
+    """(探索の起点ディレクトリ or None, ファイル) を返す。"""
     for p in paths:
         p = Path(p)
         if p.is_dir():
@@ -1133,9 +1218,89 @@ def iter_inputs(paths, recursive):
                 if f.is_file() and f.suffix.lower() in ('.txt', '.zip'):
                     yield p, f
         elif p.is_file():
-            yield p.parent, p
+            yield None, p
         else:
             print('見つかりません: %s' % p, file=sys.stderr)
+
+
+def ask(prompt, default=''):
+    try:
+        ans = input(prompt).strip()
+    except EOFError:
+        ans = ''
+    # ドラッグ＆ドロップで入力されたパスの引用符を外す
+    return ans.strip('"\'') or default
+
+
+def ask_yes_no(prompt, default=False):
+    ans = ask('%s [%s]: ' % (prompt, 'Y/n' if default else 'y/N')).lower()
+    if not ans:
+        return default
+    return ans in ('y', 'yes', 'はい', 'ｙ')
+
+
+def interactive_setup(opts):
+    """足りない設定を対話形式で尋ねる。"""
+    here = Path(__file__).resolve().parent
+    print('=== 青空文庫テキスト → EPUB 変換 ===')
+    default_out = None
+    if not opts.inputs:
+        default_in = here / 'input'
+        path = ask('変換するフォルダ (またはファイル) を入力してください。ドラッグ＆ドロップもできます。\n'
+                   '  [Enter で %s]: ' % default_in, str(default_in))
+        opts.inputs = [path]
+        if Path(path) == default_in:
+            default_in.mkdir(exist_ok=True)
+            default_out = here / 'output'
+    if opts.output is None:
+        if default_out:
+            ans = ask('出力先フォルダ ("-" で元ファイルと同じ場所)\n  [Enter で %s]: ' % default_out,
+                      str(default_out))
+        else:
+            ans = ask('出力先フォルダ\n  [Enter で元ファイルと同じ場所]: ', '-')
+        opts.output = None if ans == '-' else ans
+    if opts.writing is None:
+        ans = ask('書字方向を選んでください  1) 縦書き  2) 横書き  [Enter で 1]: ', '1')
+        opts.writing = 'yoko' if ans in ('2', '２', 'yoko', '横', '横書き') else 'tate'
+    if opts.name_from_filename is None:
+        opts.name_from_filename = ask_yes_no(
+            'ファイル名 (著者名-タイトル(…).txt) から著者名とタイトルを取得しますか？')
+    if opts.force is None:
+        opts.force = ask_yes_no('変換済みのファイルも変換し直しますか？')
+    print()
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        description='青空文庫形式のテキスト (.txt / .zip) を Kindle 向け EPUB3 に一括変換します。'
+                    '引数なしで実行すると対話形式で設定を尋ねます。')
+    ap.add_argument('inputs', nargs='*', metavar='入力',
+                    help='変換するファイル、またはディレクトリ (配下の .txt/.zip をすべて変換)')
+    ap.add_argument('-o', '--output', metavar='DIR',
+                    help='出力先ディレクトリ (省略時は元ファイルと同じ場所。ディレクトリ構成は保持)')
+    wm = ap.add_mutually_exclusive_group()
+    wm.add_argument('-w', '--writing-mode', dest='writing', choices=['tate', 'yoko'],
+                    help='書字方向: tate=縦書き (既定) / yoko=横書き')
+    wm.add_argument('--tate', '--vertical', dest='writing', action='store_const', const='tate',
+                    help='縦書きで出力する (-w tate と同じ)')
+    wm.add_argument('--yoko', '--horizontal', dest='writing', action='store_const', const='yoko',
+                    help='横書きで出力する (-w yoko と同じ)')
+    ap.add_argument('-n', '--name-from-filename', action='store_true', default=None,
+                    help='ファイル名「著者名-タイトル(…).txt」から著者名とタイトルを取得する '
+                         '(半角の - と ( が区切り)')
+    ap.add_argument('--title-filename', action='store_true',
+                    help='出力ファイル名を「[著者] 作品名.epub」にする (既定は元ファイル名)')
+    ap.add_argument('--no-auto-tcy', action='store_true',
+                    help='縦書き時に 2 桁までの半角数字や「!?」を自動で縦中横にしない')
+    ap.add_argument('--encoding', help='入力の文字コードを指定 (既定は自動判定: UTF-8 / Shift_JIS)')
+    ap.add_argument('--no-recursive', action='store_true', help='サブディレクトリを検索しない')
+    ap.add_argument('-f', '--force', action='store_true', default=None,
+                    help='EPUB が既にあって元ファイルより新しい場合も変換し直す')
+    ap.add_argument('-i', '--interactive', action='store_true',
+                    help='指定しなかった設定を対話形式で尋ねる')
+    ap.add_argument('-q', '--quiet', action='store_true', help='警告を表示しない')
+    ap.add_argument('--version', action='version', version='%(prog)s ' + __version__)
+    return ap
 
 
 def main(argv=None):
@@ -1144,55 +1309,61 @@ def main(argv=None):
             stream.reconfigure(errors='replace')
         except AttributeError:
             pass
-    ap = argparse.ArgumentParser(
-        description='青空文庫形式のテキスト (.txt / .zip) を Kindle 向け EPUB3 に一括変換します。')
-    ap.add_argument('inputs', nargs='+', metavar='入力',
-                    help='変換するファイル、またはディレクトリ (配下の .txt/.zip をすべて変換)')
-    ap.add_argument('-o', '--output', metavar='DIR',
-                    help='出力先ディレクトリ (省略時は元ファイルと同じ場所。ディレクトリ構成は保持)')
-    ap.add_argument('--horizontal', action='store_true', help='横書きで出力する (既定は縦書き)')
-    ap.add_argument('--no-auto-tcy', action='store_true',
-                    help='縦書き時に 2 桁までの半角数字や「!?」を自動で縦中横にしない')
-    ap.add_argument('--encoding', help='入力の文字コードを指定 (既定は自動判定: UTF-8 / Shift_JIS)')
-    ap.add_argument('--title-filename', action='store_true',
-                    help='出力ファイル名を「[著者] 作品名.epub」にする (既定は元ファイル名)')
-    ap.add_argument('--no-recursive', action='store_true', help='サブディレクトリを検索しない')
-    ap.add_argument('-f', '--force', action='store_true',
-                    help='EPUB が既にあって元ファイルより新しい場合も変換し直す')
-    ap.add_argument('-q', '--quiet', action='store_true', help='警告を表示しない')
-    ap.add_argument('--version', action='version', version='%(prog)s ' + __version__)
-    opts = ap.parse_args(argv)
+    opts = build_parser().parse_args(argv)
+    interactive = opts.interactive or not opts.inputs
+    if interactive:
+        interactive_setup(opts)
+    opts.writing = opts.writing or 'tate'
+    opts.force = bool(opts.force)
+    opts.name_from_filename = bool(opts.name_from_filename)
+    try:
+        return run(opts)
+    finally:
+        if interactive:
+            ask('\nEnter キーを押すと終了します。')
 
+
+def run(opts):
     targets = list(iter_inputs(opts.inputs, not opts.no_recursive))
     if not targets:
-        print('変換対象のファイル (.txt / .zip) が見つかりませんでした。')
+        print('変換対象のファイル (.txt / .zip) が見つかりませんでした: %s' % ', '.join(opts.inputs))
         return 1
+    print('書字方向: %s / ファイル名から著者名・タイトルを取得: %s'
+          % ('縦書き' if opts.writing == 'tate' else '横書き',
+             'する' if opts.name_from_filename else 'しない'))
+    covers = CoverFinder()
+    recursive = not opts.no_recursive
     ok = skipped = failed = 0
     total = len(targets)
     for k, (root, f) in enumerate(targets, 1):
-        out_dir = Path(opts.output) / f.parent.relative_to(root) if opts.output else f.parent
+        base = f.parent if root is None else root
+        out_dir = Path(opts.output) / f.parent.relative_to(base) if opts.output else f.parent
         prefix = '[%d/%d] %s' % (k, total, f)
+        is_zip = f.suffix.lower() == '.zip'
+        cover = covers.find([f.stem], f.parent, root, recursive)
         if not opts.force and not opts.title_filename:
             existing = out_dir / (f.stem + '.epub')
-            if existing.is_file() and existing.stat().st_mtime >= f.stat().st_mtime:
-                print('%s -> スキップ (変換済み)' % prefix)
+            newest = max(f.stat().st_mtime, cover.stat().st_mtime if cover else 0)
+            if existing.is_file() and existing.stat().st_mtime >= newest:
+                print('%s -> スキップ (変換済み。変換し直すには -f)' % prefix)
                 skipped += 1
                 continue
         try:
-            if f.suffix.lower() == '.zip':
-                results = convert_zip(f, out_dir, opts)
+            if is_zip:
+                results = convert_zip(f, out_dir, opts, covers, root)
                 if not results:
                     print('%s -> zip 内にテキストファイルがありません' % prefix)
                     skipped += 1
                     continue
             else:
-                results = [convert_file(f, out_dir, opts)]
+                results = [convert_file(f, out_dir, opts, cover=cover)]
         except Exception as e:   # 1 ファイルの失敗で全体を止めない
             print('%s -> 失敗: %s: %s' % (prefix, type(e).__name__, e), file=sys.stderr)
             failed += 1
             continue
         for out_path, book in results:
-            print('%s -> %s  (%s / %s)' % (prefix, out_path, book.title, book.author or '著者不明'))
+            print('%s -> %s  (%s / %s%s)' % (prefix, out_path, book.title, book.author or '著者不明',
+                                            ' / 表紙: %s' % book.cover.name if book.cover else ''))
             if not opts.quiet:
                 for w in book.warnings[:10]:
                     print('    警告: %s' % w)

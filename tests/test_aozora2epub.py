@@ -160,5 +160,70 @@ class DocumentTest(unittest.TestCase):
             self.assertEqual(epub.stat().st_mtime_ns, mtime)
 
 
+class FilenameAndCoverTest(unittest.TestCase):
+    def test_parse_filename(self):
+        f = a2e.parse_filename
+        self.assertEqual(f('夏目漱石-こころ(上 先生と私)'), ('夏目漱石', 'こころ'))
+        self.assertEqual(f('夏目漱石-こころ'), ('夏目漱石', 'こころ'))
+        self.assertEqual(f('著者-題名-続き[新版]'), ('著者', '題名-続き'))
+        self.assertEqual(f('夏目漱石－こころ（全角）'), (None, None))   # 全角は区切りではない
+        self.assertEqual(f('773_ruby_5968'), (None, None))
+
+    def _run(self, tmp, *args):
+        out = tmp / 'out'
+        self.assertEqual(a2e.main([str(tmp / 'in'), '-o', str(out), '-q'] + list(args)), 0)
+        return out
+
+    def test_name_from_filename_and_cover_in_other_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / 'in' / 'text').mkdir(parents=True)
+            (tmp / 'in' / 'images').mkdir()
+            stem = '芥川竜之介-羅生門(新字新仮名)'
+            (tmp / 'in' / 'text' / (stem + '.txt')).write_bytes('本文の題\n本文の著者\n\n本文\n'.encode('cp932'))
+            (tmp / 'in' / 'images' / (stem + '.png')).write_bytes(PNG)
+            out = self._run(tmp, '-n', '--yoko')
+            with zipfile.ZipFile(out / 'text' / (stem + '.epub')) as z:
+                opf = z.read('OEBPS/content.opf').decode('utf-8')
+                self.assertIn('<dc:title id="title">羅生門</dc:title>', opf)
+                self.assertIn('<dc:creator id="creator">芥川竜之介</dc:creator>', opf)
+                self.assertIn('properties="cover-image"', opf)
+                self.assertIn('<itemref idref="coverpage"/>', opf)
+                self.assertNotIn('page-progression-direction', opf)
+                self.assertIn('<h1 class="title">羅生門</h1>',
+                              z.read('OEBPS/text/title.xhtml').decode('utf-8'))
+                self.assertIn('horizontal-tb', z.read('OEBPS/style/book.css').decode('utf-8'))
+
+    def test_header_used_without_option(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / 'in').mkdir()
+            (tmp / 'in' / '著者-題.txt').write_bytes('本文の題\n本文の著者\n\n本文\n'.encode('cp932'))
+            out = self._run(tmp, '-w', 'tate')
+            with zipfile.ZipFile(out / '著者-題.epub') as z:
+                opf = z.read('OEBPS/content.opf').decode('utf-8')
+                self.assertIn('<dc:title id="title">本文の題</dc:title>', opf)
+                self.assertIn('page-progression-direction="rtl"', opf)
+                self.assertNotIn('cover', opf)
+
+    def test_interactive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / 'in').mkdir()
+            (tmp / 'in' / '著者-題.txt').write_bytes('本文の題\n本文の著者\n\n本文\n'.encode('cp932'))
+            answers = iter([str(tmp / 'in'), '"%s"' % (tmp / 'out'), '2', 'y', '', ''])
+            orig = a2e.input if hasattr(a2e, 'input') else None
+            a2e.input = lambda prompt='': next(answers)
+            try:
+                self.assertEqual(a2e.main(['-q']), 0)
+            finally:
+                if orig is None:
+                    del a2e.input
+            with zipfile.ZipFile(tmp / 'out' / '著者-題.epub') as z:
+                opf = z.read('OEBPS/content.opf').decode('utf-8')
+                self.assertIn('<dc:title id="title">題</dc:title>', opf)
+                self.assertNotIn('page-progression-direction', opf)
+
+
 if __name__ == '__main__':
     unittest.main()
