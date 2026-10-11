@@ -17,6 +17,7 @@ import re
 import sys
 import tempfile
 import uuid
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
@@ -659,6 +660,9 @@ class Converter:
                         page.lines.append(BLANK_LINE)
             elif any(u.kind not in ('open', 'close') for u in units):
                 line, level, label = self.render_line(units, ctx)
+                if not well_formed(line):
+                    self.warn('変換結果が不正になった行をそのまま出力しました: %s' % text[:40])
+                    line = '<p>%s</p>' % esc(strip_markup(text))
                 if page.size > self.HARD_PAGE_LIMIT or (level and page.size > self.SOFT_PAGE_LIMIT):
                     new_page()
                     page = pages[-1]
@@ -674,6 +678,14 @@ class Converter:
 
 
 BLANK_LINE = '<p><br/></p>'
+
+
+def well_formed(fragment):
+    try:
+        ET.fromstring(fragment)
+        return True
+    except ET.ParseError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -694,13 +706,21 @@ class Book:
         self.colophon_lines = []
         self.images = {}
         self.cover = None
+        self.cover_annotation = None
         self.vertical = True
         self.source = None
         self.warnings = []
 
 
+RE_XML_INVALID = re.compile('[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufffe\uffff]')
+
+
 def read_text(path, encoding=None):
-    data = Path(path).read_bytes()
+    """ファイルを読み、XHTML に入れられない制御文字を取り除いて返す。"""
+    return RE_XML_INVALID.sub('', _decode(Path(path).read_bytes(), encoding))
+
+
+def _decode(data, encoding):
     if encoding:
         return data.decode(encoding, errors='replace')
     if data.startswith(b'\xef\xbb\xbf'):
@@ -739,7 +759,9 @@ def split_document(lines):
         i += 1
     start = i
     # 表題は冒頭の空行までの数行。空行を挟まずに本文が始まる場合は本文らしい行の手前まで
-    while i < len(lines) and lines[i].strip() and not looks_like_body(lines[i], i == start):
+    # (［＃区切り線］のような注記だけの行も表題の終わりとみなす)
+    while i < len(lines) and strip_markup(lines[i]).strip(' 　\t') \
+            and not looks_like_body(lines[i], i == start):
         i += 1
     header = lines[start:i]
     if not header or len(header) > 6 or any(RE_DASHES.match(h) for h in header) \
@@ -790,11 +812,33 @@ def parse_header(header, fallback_title):
     return title, subtitle, author, contributors
 
 
+RE_COVER = re.compile(r'^［＃表紙（(?P<file>[^（）、]+)(?:、[^）]*)?）(?:入る)?］$')
+
+
+def take_cover_annotation(lines, base_dir):
+    """冒頭の ［＃表紙（表紙.jpg）］ を取り除き、画像があればそのパスを返す。"""
+    cover = None
+    for k in range(min(len(lines), 10)):
+        m = RE_COVER.match(lines[k].strip())
+        if m:
+            del lines[k]
+            path = Path(base_dir) / m.group('file')
+            if path.suffix.lower() in IMAGE_EXTS and path.is_file():
+                cover = path
+            break
+    return cover
+
+
 def convert_text(text, base_dir, name, vertical=True, auto_tcy=True):
     """青空文庫形式のテキストを解析して Book を返す。"""
     lines = text.splitlines()
+    cover = take_cover_annotation(lines, base_dir)
+    # 冒頭の注記だけの行 (［＃改ページ］など) は表題の判定から外す
+    while lines and lines[0].strip() and not strip_markup(lines[0]).strip(' 　\t'):
+        del lines[0]
     header, body, footer = split_document(lines)
     book = Book()
+    book.cover_annotation = cover
     book.vertical = vertical
     book.title, book.subtitle, book.author, book.contributors = parse_header(header, name)
     conv = Converter(base_dir, vertical=vertical, auto_tcy=auto_tcy)
@@ -1191,7 +1235,7 @@ def convert_file(txt_path, out_dir, opts, out_stem=None, name_stem=None, cover=N
     book = convert_text(text, txt_path.parent, txt_path.stem,
                         vertical=opts.writing != 'yoko', auto_tcy=not opts.no_auto_tcy)
     book.source = txt_path.name
-    book.cover = cover
+    book.cover = cover or book.cover_annotation
     if opts.name_from_filename:
         apply_filename_metadata(book, name_stem or txt_path.stem)
     if opts.title_filename:
@@ -1402,8 +1446,9 @@ def run(opts):
             failed += 1
             continue
         for out_path, book in results:
-            print('%s -> %s  (%s / %s%s)' % (prefix, out_path, book.title, book.author or '著者不明',
-                                            ' / 表紙: %s' % book.cover.name if book.cover else ''))
+            print('%s -> %s  (%s / %s / 本文 %d ページ%s)'
+                  % (prefix, out_path, book.title, book.author or '著者不明', len(book.pages),
+                     ' / 表紙: %s' % book.cover.name if book.cover else ''))
             if not opts.quiet:
                 for w in book.warnings[:10]:
                     print('    警告: %s' % w)

@@ -150,6 +150,26 @@ class DocumentTest(unittest.TestCase):
         book, _ = self._body('「いき」の構造\n九鬼周造\n\n　本文。\n')
         self.assertEqual((book.title, book.author), ('「いき」の構造', '九鬼周造'))
 
+    def test_cover_annotation_and_separator_in_header(self):
+        text = ('［＃表紙（表紙.jpg）］\nタイトル\n著者\n［＃区切り線］\nあらすじ：\n'
+                '［＃区切り線］\n\n［＃改ページ］\n　本文。\n')
+        book, body = self._body(text)
+        self.assertEqual((book.title, book.subtitle, book.author), ('タイトル', '', '著者'))
+        self.assertIn('<p>　本文。</p>', body)
+        self.assertIsNone(book.cover_annotation)   # 表紙.jpg は存在しない
+
+    def test_cover_annotation_image_is_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / '表紙.png').write_bytes(PNG)
+            book = a2e.convert_text('［＃表紙（表紙.png）］\n題\n著者\n\n本文\n', tmp, 'x')
+            self.assertEqual(book.cover_annotation.name, '表紙.png')
+
+    def test_control_characters_are_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'a.txt'
+            path.write_bytes('題\n著者\n\n本\x0c文\x1a\n'.encode('cp932'))
+            self.assertEqual(a2e.read_text(path), '題\n著者\n\n本文\n')
+
     def test_warns_when_body_is_empty(self):
         book, body = self._body('タイトル\n著者\n')
         self.assertEqual(body, [])
