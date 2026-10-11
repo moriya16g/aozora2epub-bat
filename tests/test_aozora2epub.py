@@ -127,6 +127,34 @@ class DocumentTest(unittest.TestCase):
         book = a2e.convert_text(text, '.', 'fallback')
         self.assertEqual(book.title, 'fallback')
 
+    def _body(self, text):
+        book = a2e.convert_text(text, '.', 'x')
+        return book, [line for p in book.pages for line in p.lines]
+
+    def test_no_blank_line_after_author(self):
+        book, body = self._body('タイトル\n著者\n　本文一行目。\n　本文二行目。\n')
+        self.assertEqual((book.title, book.author), ('タイトル', '著者'))
+        self.assertEqual(body, ['<p>　本文一行目。</p>', '<p>　本文二行目。</p>'])
+
+    def test_sokohon_before_body(self):
+        book, body = self._body('タイトル\n著者\n\n底本：「タイトル」文庫\n入力：誰か\n\n　本文。\n')
+        self.assertEqual(body, ['<p>　本文。</p>'])
+        self.assertTrue(any('底本：' in line for line in book.colophon_lines))
+
+    def test_separator_lines_are_not_legend(self):
+        sep = '-' * 40
+        _, body = self._body('タイトル\n著者\n\n%s\n　本文。\n%s\n' % (sep, sep))
+        self.assertIn('<p>　本文。</p>', body)
+
+    def test_title_starting_with_bracket(self):
+        book, _ = self._body('「いき」の構造\n九鬼周造\n\n　本文。\n')
+        self.assertEqual((book.title, book.author), ('「いき」の構造', '九鬼周造'))
+
+    def test_warns_when_body_is_empty(self):
+        book, body = self._body('タイトル\n著者\n')
+        self.assertEqual(body, [])
+        self.assertIn('本文が見つかりませんでした', book.warnings[0])
+
     def test_batch_conversion(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)

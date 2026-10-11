@@ -715,34 +715,64 @@ def read_text(path, encoding=None):
     return data.decode('cp932', errors='replace')
 
 
+RE_DASHES = re.compile(r'^-{10,}\s*$')
+RE_SOKOHON = re.compile(r'^底本[：:]')
+
+
+def looks_like_body(line, first=False):
+    """表題・著者名の行ではなく本文らしい行か。"""
+    s = strip_markup(line).rstrip()
+    if s[:1] in ('　', ' ', '\t') or s.endswith('。') or len(s) > 40:
+        return True
+    # 1 行目 (作品名) は「いき」の構造 のように括弧で始まることがある
+    return not first and s[:1] in ('「', '『')
+
+
+def has_text(lines):
+    return any(strip_markup(l).strip(' 　\t') for l in lines)
+
+
 def split_document(lines):
     """(表題行, 本文行, 底本情報行) に分ける。"""
     i = 0
     while i < len(lines) and not lines[i].strip():
         i += 1
     start = i
-    while i < len(lines) and lines[i].strip():
+    # 表題は冒頭の空行までの数行。空行を挟まずに本文が始まる場合は本文らしい行の手前まで
+    while i < len(lines) and lines[i].strip() and not looks_like_body(lines[i], i == start):
         i += 1
     header = lines[start:i]
-    if not header or len(header) > 6 or any(re.match(r'^-{10,}', h) for h in header) \
+    if not header or len(header) > 6 or any(RE_DASHES.match(h) for h in header) \
             or any(len(strip_markup(h)) > 80 for h in header):
         header, i = [], start
-    # 【テキスト中に現れる記号について】のブロックを飛ばす
+
+    # 【テキスト中に現れる記号について】のブロックを飛ばす (本文中の区切り線は残す)
     j = i
     while j < len(lines) and not lines[j].strip():
         j += 1
-    if j < len(lines) and re.match(r'^-{10,}\s*$', lines[j]):
+    if j < len(lines) and RE_DASHES.match(lines[j]):
         k = j + 1
-        while k < len(lines) and not re.match(r'^-{10,}\s*$', lines[k]):
+        while k < len(lines) and k - j < 80 and not RE_DASHES.match(lines[k]):
             k += 1
-        if k < len(lines) and k - j < 200:
+        if k < len(lines) and RE_DASHES.match(lines[k]) and \
+                any('記号について' in l or '：ルビ' in l for l in lines[j:k]):
             i = k + 1
+
+    # 底本情報は通常は末尾。本文より前にある場合は、その段落だけを底本情報に回す
+    candidates = [k for k in range(i, len(lines)) if RE_SOKOHON.match(lines[k])]
+    front = []
+    if candidates and not has_text(lines[i:candidates[0]]):
+        e = candidates[0]
+        while e < len(lines) and lines[e].strip():
+            e += 1
+        front, i = lines[candidates[0]:e], e
     footer = len(lines)
-    for k in range(i, len(lines)):
-        if re.match(r'^底本[：:]', lines[k]):
+    for k in candidates:
+        if k >= i and has_text(lines[i:k]):
             footer = k
             break
-    return header, lines[i:footer], lines[footer:]
+    back = lines[footer:]
+    return header, lines[i:footer], front + ([''] if front and back else []) + back
 
 
 def parse_header(header, fallback_title):
@@ -798,6 +828,8 @@ def convert_text(text, base_dir, name, vertical=True, auto_tcy=True):
         book.colophon_lines.extend(p.lines)
     book.images = conv.images
     book.warnings = conv.warnings + colophon.warnings
+    if not book.pages:
+        book.warnings.insert(0, '本文が見つかりませんでした。テキストの形式を確認してください')
     return book
 
 
@@ -1166,9 +1198,16 @@ def convert_file(txt_path, out_dir, opts, out_stem=None, name_stem=None, cover=N
         name = ('[%s] ' % book.author if book.author else '') + book.title + \
                (' ' + book.subtitle if book.subtitle else '')
         stem = safe_filename(name)
+        # 同じ名前になる別の作品 (上巻・下巻など) を上書きしないよう、元のファイル名に戻す
+        written = getattr(opts, 'written', None)
+        if written is not None and str(Path(out_dir) / (stem + '.epub')) in written:
+            book.warnings.append('出力名「%s.epub」が他の作品と重なるため、元のファイル名で出力しました' % stem)
+            stem = out_stem or txt_path.stem
     else:
         stem = out_stem or txt_path.stem
     out_path = Path(out_dir) / (stem + '.epub')
+    if getattr(opts, 'written', None) is not None:
+        opts.written.add(str(out_path))
     write_epub(book, out_path)
     return out_path, book
 
@@ -1332,6 +1371,7 @@ def run(opts):
           % ('縦書き' if opts.writing == 'tate' else '横書き',
              'する' if opts.name_from_filename else 'しない'))
     covers = CoverFinder()
+    opts.written = set()
     recursive = not opts.no_recursive
     ok = skipped = failed = 0
     total = len(targets)
